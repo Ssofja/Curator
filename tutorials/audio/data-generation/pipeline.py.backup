@@ -1,0 +1,117 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# pip install vllm
+import argparse
+import os
+import shutil
+import sys
+
+from loguru import logger
+
+from nemo_curator.backends.xenna import XennaExecutor
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.audio.common import GetAudioDurationStage, PreserveByValueStage
+from nemo_curator.stages.text.io.reader import JsonlReader
+from nemo_curator.stages.audio.inference.asr_nemo import InferenceAsrNemoStage
+from nemo_curator.stages.audio.io.convert import AudioToDocumentStage
+from tutorials.audio.vllm_tutorial.vllm_inference import vLLMInference, DocumentToAudioStage
+from nemo_curator.stages.resources import Resources
+from nemo_curator.stages.text.io.writer import JsonlWriter
+
+
+def create_audio_pipeline(args: argparse.Namespace) -> Pipeline:
+    # Define pipeline
+    pipeline = Pipeline(name="audio_inference", description="Inference audio and filter by WER threshold.")
+
+    pipeline.add_stage(
+        JsonlReader(
+            file_paths=os.path.join(args.raw_data_dir, "in.jsonl"),
+        )
+    )
+    pipeline.add_stage(
+        DocumentToAudioStage()
+    )
+    
+    pipeline.add_stage(
+        vLLMInference(
+            generation_field = "src_text",
+            prompt_file = os.path.join(args.raw_data_dir, "prompt.yaml"),
+            num_generations = 1,
+            model = {
+                "model" : "Qwen/Qwen2.5-7B-Instruct-1M", #"Qwen/Qwen2.5-7B-Instruct-1M"
+                "tensor_parallel_size": 1,  # Reduced from 2 to 1 for GPU compatibility
+                "max_model_len": 2048,
+                "enable_chunked_prefill": True,
+                "max_num_batched_tokens": 1024,
+                "enforce_eager": True,
+                "dtype": "float16",
+                "gpu_memory_utilization": 0.8,  # Reduced from 0.95 to avoid GPU memory issues
+                "max_num_seqs": 8,  # Reduced from 16 to lower GPU requirements
+                # "device": "auto",  # Let vLLM auto-detect available device
+            },
+        apply_chat_template = {
+            "tokenize": False,           # Return string, not token IDs
+            "add_generation_prompt": True  # Add assistant prompt
+        }
+
+        ).with_(batch_size=64, resources=Resources(gpus=1))
+    )
+    pipeline.add_stage(AudioToDocumentStage().with_(batch_size=1))
+    pipeline.add_stage(
+        JsonlWriter(
+            path=os.path.join(args.raw_data_dir, "result"),
+            write_kwargs={"force_ascii": False},
+        )
+    )
+    return pipeline
+
+def main(args: argparse.Namespace) -> None:
+    """
+    Prepare FLEURS dataset, run ASR inference and filer by WER threshold.
+    """
+    # Configure logging verbosity
+    logger.remove()
+    logger.add(sys.stderr, level="DEBUG" if args.verbose else "INFO")
+
+    pipeline = create_audio_pipeline(args)
+
+    # Print pipeline description
+    logger.info(pipeline.describe())
+    logger.info("\n" + "=" * 50 + "\n")
+
+    # Create executor
+    executor = XennaExecutor()
+
+    # Execute pipeline
+    logger.info("Starting pipeline execution...")
+    r = pipeline.run(executor)
+
+    print(r)
+
+    # Print results
+    logger.info("\nPipeline completed!")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    # General arguments
+    parser.add_argument("--raw_data_dir", type=str, required=True, help="Path to store processed data")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose (DEBUG) logging",
+    )
+    args = parser.parse_args()
+    main(args)

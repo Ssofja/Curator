@@ -1,0 +1,78 @@
+# Docker Compose configuration for NeMo Curator Audio Pipeline
+version: '3.8'
+
+services:
+  nemo-curator-audio:
+    image: nemo-curator-audio:25.09-mfa
+    container_name: nemo-curator-audio
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RAY_DASHBOARD_HOST=0.0.0.0
+      - CUDA_VISIBLE_DEVICES=0,1,2,3  # Adjust based on your GPU count
+    ports:
+      - "8265:8265"  # Ray dashboard
+    volumes:
+      # Mount your data directories
+      - ./in:/workspace/data/input
+      - ./out:/workspace/data/output
+      - ./voices:/workspace/data/voices
+      # Optional: mount logs directory
+      - ./logs:/workspace/logs
+    shm_size: '16gb'  # Increase shared memory for Ray
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      bash -c "
+      echo 'NeMo Curator Audio Pipeline Container Started';
+      echo 'Ray Dashboard: http://localhost:8265';
+      echo '';
+      echo 'To run the pipeline:';
+      echo '  python pipeline_all.py --raw-data-dir=/workspace/data/input --output-dir=/workspace/data/output --num-conversations=100 --reference-voices=/workspace/data/voices';
+      echo '';
+      tail -f /dev/null
+      "
+
+  # Optional: separate service for running the pipeline
+  pipeline-runner:
+    image: nemo-curator-audio:25.09-mfa
+    container_name: nemo-curator-pipeline
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - RAY_DASHBOARD_HOST=0.0.0.0
+    ports:
+      - "8266:8265"  # Different port to avoid conflict
+    volumes:
+      - ./in:/workspace/data/input
+      - ./out:/workspace/data/output
+      - ./voices:/workspace/data/voices
+      - ./logs:/workspace/logs
+    shm_size: '16gb'
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      python pipeline_all.py
+      --raw-data-dir=/workspace/data/input
+      --output-dir=/workspace/data/output
+      --num-conversations=100
+      --reference-voices=/workspace/data/voices
+      --verbose
+    profiles:
+      - run  # Only start with: docker-compose --profile run up
