@@ -15,14 +15,11 @@
 
 import yaml
 import json
-import random
 import re
 import hashlib
 import jsonschema
-from tqdm import tqdm
 from loguru import logger
 from nemo_curator.stages.base import ProcessingStage
-import pandas as pd
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.tasks import AudioBatch, DocumentBatch
@@ -67,6 +64,10 @@ class vLLMInference(ProcessingStage[AudioBatch, AudioBatch]):
             pip install "optree>=0.13.0" vllm
 
     """
+    num_workers = None
+    batch_size = 1
+    name = "vLLMInference"  # Stage identifier for pipeline configuration
+    
     CONVERSATION_SCHEMA = {
         "type": "object",
         "properties": {

@@ -1,3 +1,24 @@
+"""
+Pipeline with Parallel vLLM Execution
+
+This version uses vllm_inference_streaming.py and topic_expander_updated.py
+to enable parallel processing across multiple GPUs.
+
+Usage:
+    # For 8 GPUs with 80 conversations (10 per batch):
+    python pipeline_all_updated.py \\
+        --raw-data-dir=/path/to/data \\
+        --reference-voices=/path/to/voices \\
+        --num-conversations=80 \\
+        --batch-size=10 \\
+        --verbose
+
+    # The pipeline will:
+    # 1. TopicExpander: Create 8 batches (10 conversations each)
+    # 2. vLLMInference: Spawn 8 workers (1 per GPU) to process batches in parallel
+    # 3. Each worker loads vLLM once and processes 10 conversations at a time
+"""
+
 import argparse
 import glob
 import json
@@ -61,7 +82,6 @@ def parse_args():
     
     parser.add_argument("--max-pause-duration", type=float, default=2.0)
     parser.add_argument("--randomize-pauses", action="store_true")
-    parser.add_argument("--num-workers", type=int, default=1)
     
     return parser.parse_args()
 
@@ -113,6 +133,7 @@ def main():
     pipeline = Pipeline(name="end_to_end_pipeline")
     executor = XennaExecutor(config={
         "execution_mode": "batch",
+        "autoscale_interval_s": 1,  # Faster autoscaling response
     })
     
     if not args.skip_llm:
@@ -152,7 +173,7 @@ def main():
                 apply_chat_template={
                     "tokenize": False,
                     "add_generation_prompt": True
-                }
+                },
             ).with_(
                 batch_size=args.batch_size, 
                 resources=Resources(gpus=1)
