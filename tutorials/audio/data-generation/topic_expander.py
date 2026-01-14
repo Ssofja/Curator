@@ -57,8 +57,6 @@ class TopicExpander(ProcessingStage):
         
         if seed is not None:
             random.seed(seed)
-        
-        logger.info(f"TopicExpander initialized: {num_conversations} conversations, {conversations_per_batch} per batch")
     
     def xenna_stage_spec(self) -> dict[str, Any]:
         """Configure for sequential execution (processes all topics at once)."""
@@ -69,9 +67,7 @@ class TopicExpander(ProcessingStage):
     def process(self, batch: AudioBatch) -> list[AudioBatch]:
         """
         Expand topics into batches of conversations.
-        Creates larger batches to enable efficient parallel processing.
         """
-        # Collect all topics from the input batch
         topics = []
         for entry in batch.data:
             if isinstance(entry, dict) and 'topic' in entry:
@@ -83,9 +79,6 @@ class TopicExpander(ProcessingStage):
             logger.error("No topics found in input batch!")
             return []
         
-        logger.info(f"Found {len(topics)} topics, expanding to {self.num_conversations} conversations in batches of {self.conversations_per_batch}")
-        
-        # Create batches with multiple conversations each
         output_batches = []
         current_batch_entries = []
         
@@ -97,7 +90,6 @@ class TopicExpander(ProcessingStage):
             }
             current_batch_entries.append(entry)
             
-            # When we have enough conversations, create a batch
             if len(current_batch_entries) >= self.conversations_per_batch:
                 output_batches.append(AudioBatch(
                     data=current_batch_entries,
@@ -106,14 +98,11 @@ class TopicExpander(ProcessingStage):
                 ))
                 current_batch_entries = []
         
-        # Add remaining conversations as final batch
         if current_batch_entries:
             output_batches.append(AudioBatch(
                 data=current_batch_entries,
                 task_id=f"conversations_{len(output_batches)}",
                 dataset_name=batch.dataset_name,
             ))
-        
-        logger.info(f"✅ Created {len(output_batches)} batches for parallel processing")
         
         return output_batches

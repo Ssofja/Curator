@@ -1,0 +1,300 @@
+#!/bin/bash
+#SBATCH --job-name=curator_multinode
+#SBATCH --account=YOUR_SLURM_ACCOUNT
+#SBATCH --partition=batch_block1,batch_block2,batch_block3,batch_block4
+#SBATCH --time=04:00:00
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=8
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=0
+#SBATCH --exclusive
+#SBATCH --signal=SIGINT@600
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+
+# =============================================================================
+# Multi-Node Ray Cluster for NeMo Curator Audio Pipeline
+# =============================================================================
+#
+# This script starts a distributed Ray cluster and runs the audio data
+# generation pipeline across multiple nodes.
+#
+# REQUIRED CONFIGURATION:
+#   1. Update SLURM account (line 3)
+#   2. Set CONTAINER_IMAGE path (line 69)
+#   3. Set CONTAINER_MOUNTS path (line 70)
+#   4. Set HF_TOKEN environment variable or update inline (lines 142, 185, 240)
+#   5. Update WORK_DIR if needed (line 75)
+#
+# Usage:
+#   sbatch run_multinode.sh.template \
+#       --output-dir /path/to/output \
+#       --prompt-file /path/to/prompt.yaml \
+#       [--num-conversations N] \
+#       [--batch-size N] \
+#       [--reference-voices /path/to/voices]
+#
+# =============================================================================
+
+set -e
+
+OUTPUT_DIR=""
+PROMPT_FILE=""
+INPUT_MANIFEST=""
+NUM_CONVERSATIONS=30
+BATCH_SIZE=1
+REFERENCE_VOICES="${REFERENCE_VOICES:-/path/to/reference/voices}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --prompt-file)
+            PROMPT_FILE="$2"
+            shift 2
+            ;;
+        --input-manifest)
+            INPUT_MANIFEST="$2"
+            shift 2
+            ;;
+        --num-conversations)
+            NUM_CONVERSATIONS="$2"
+            shift 2
+            ;;
+        --batch-size)
+            BATCH_SIZE="$2"
+            shift 2
+            ;;
+        --reference-voices)
+            REFERENCE_VOICES="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: sbatch run_multinode.sh.template --output-dir DIR --prompt-file FILE [OPTIONS]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$OUTPUT_DIR" ]] || [[ -z "$PROMPT_FILE" ]]; then
+    echo "ERROR: --output-dir and --prompt-file are required"
+    exit 1
+fi
+
+# =============================================================================
+# Container and Environment Configuration
+# =============================================================================
+# Update these paths for your environment
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-/path/to/nemo-curator-audio.sqsh}"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/your/host/path:/container/mount/path}"
+
+# Ray configuration
+RAY_PORT=6379
+DASHBOARD_PORT=8265
+
+# Working directory inside container
+WORK_DIR="${WORK_DIR:-/workspace/curator/tutorials/audio/data-generation}"
+MFA_COMMAND="mfa"
+
+SRUN_OPTS=""
+
+# =============================================================================
+# Node Configuration
+# =============================================================================
+ALL_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
+HEAD_NODE=$(echo "$ALL_NODES" | head -n 1)
+WORKER_NODES=$(echo "$ALL_NODES" | tail -n +2)
+NUM_NODES=$(echo "$ALL_NODES" | wc -l)
+HEAD_NODE_IP=$(srun $SRUN_OPTS --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+    --container-image="$CONTAINER_IMAGE" \
+    --container-mounts="$CONTAINER_MOUNTS" \
+    hostname -i 2>/dev/null | awk '{print $1}')
+
+CPUS_PER_NODE=64
+GPUS_PER_NODE=8
+TOTAL_CPUS=$((NUM_NODES * CPUS_PER_NODE))
+TOTAL_GPUS=$((NUM_NODES * GPUS_PER_NODE))
+
+echo "=============================================================================="
+echo "Multi-Node Ray Cluster Setup"
+echo "=============================================================================="
+echo "Job ID:           $SLURM_JOB_ID"
+echo "Nodes:            $NUM_NODES"
+echo "Head:             $HEAD_NODE ($HEAD_NODE_IP)"
+echo "Ray Address:      $HEAD_NODE_IP:$RAY_PORT"
+echo "CPUs:             $TOTAL_CPUS"
+echo "GPUs:             $TOTAL_GPUS"
+echo "Output:           $OUTPUT_DIR"
+echo "Prompt:           $PROMPT_FILE"
+echo "Conversations:    $NUM_CONVERSATIONS"
+echo "=============================================================================="
+
+# =============================================================================
+# Step 1: Start Ray Head Node
+# =============================================================================
+echo ""
+echo "Step 1: Starting Ray head node on $HEAD_NODE..."
+
+srun $SRUN_OPTS --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+    --container-image="$CONTAINER_IMAGE" \
+    --container-mounts="$CONTAINER_MOUNTS" \
+    bash -c "
+        export PATH=/opt/micromamba/envs/py310/bin:\$PATH
+        
+        pip install --no-cache-dir click==8.1.7 2>/dev/null
+        
+        export RAY_MAX_LIMIT_FROM_API_SERVER=40000
+        export RAY_MAX_LIMIT_FROM_DATA_SOURCE=40000
+        export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=0
+        
+        # Set your Hugging Face token here or via environment variable
+        export HF_HOME=\${HF_HOME:-/tmp/.cache/huggingface}
+        export HF_TOKEN=\${HF_TOKEN:-your_huggingface_token_here}
+        
+        echo '  Starting Ray head with $CPUS_PER_NODE CPUs and $GPUS_PER_NODE GPUs...'
+        ray start --head \
+            --port=$RAY_PORT \
+            --dashboard-port=$DASHBOARD_PORT \
+            --num-cpus=$CPUS_PER_NODE \
+            --num-gpus=$GPUS_PER_NODE \
+            --block
+    " &
+
+HEAD_PID=$!
+echo "  Head node starting in background (PID: $HEAD_PID)..."
+echo "  Waiting 30 seconds for head node to initialize..."
+sleep 30
+
+# =============================================================================
+# Step 2: Start Ray Worker Nodes
+# =============================================================================
+echo ""
+echo "Step 2: Starting Ray worker nodes..."
+
+WORKER_PIDS=""
+for NODE in $WORKER_NODES; do
+    echo "  Starting worker on $NODE..."
+    srun $SRUN_OPTS --overlap --nodes=1 --ntasks=1 -w "$NODE" \
+        --container-image="$CONTAINER_IMAGE" \
+        --container-mounts="$CONTAINER_MOUNTS" \
+        bash -c "
+            export PATH=/opt/micromamba/envs/py310/bin:\$PATH
+            
+            pip install --no-cache-dir click==8.1.7 2>/dev/null
+            
+            export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=0
+            
+            export HF_HOME=\${HF_HOME:-/tmp/.cache/huggingface}
+            export HF_TOKEN=\${HF_TOKEN:-your_huggingface_token_here}
+            
+            echo '  Connecting to Ray cluster at $HEAD_NODE_IP:$RAY_PORT...'
+            ray start \
+                --address=$HEAD_NODE_IP:$RAY_PORT \
+                --num-cpus=$CPUS_PER_NODE \
+                --num-gpus=$GPUS_PER_NODE \
+                --block
+        " &
+    WORKER_PIDS="$WORKER_PIDS $!"
+done
+
+echo "  Waiting 30 seconds for workers to connect..."
+sleep 30
+
+# =============================================================================
+# Step 3: Verify Cluster Status
+# =============================================================================
+echo ""
+echo "Step 3: Verifying cluster status..."
+
+srun $SRUN_OPTS --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+    --container-image="$CONTAINER_IMAGE" \
+    --container-mounts="$CONTAINER_MOUNTS" \
+    bash -c "
+        export PATH=/opt/micromamba/envs/py310/bin:\$PATH
+        pip install --no-cache-dir click==8.1.7 2>/dev/null
+        ray status
+    "
+
+# =============================================================================
+# Step 4: Run the Pipeline
+# =============================================================================
+echo ""
+echo "Step 4: Running the audio generation pipeline..."
+echo "=============================================================================="
+
+OPTIONAL_ARGS=""
+if [[ -n "$INPUT_MANIFEST" ]]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --input-manifest=$INPUT_MANIFEST"
+fi
+
+srun $SRUN_OPTS --overlap --nodes=1 --ntasks=1 -w "$HEAD_NODE" \
+    --container-image="$CONTAINER_IMAGE" \
+    --container-mounts="$CONTAINER_MOUNTS" \
+    bash -c "
+        export PATH=/opt/micromamba/envs/py310/bin:\$PATH
+        
+        pip install --no-cache-dir nvidia-ml-py click==8.1.7 2>/dev/null
+        
+        export HF_HOME=\${HF_HOME:-/tmp/.cache/huggingface}
+        export HF_TOKEN=\${HF_TOKEN:-your_huggingface_token_here}
+        export VLLM_USE_V1=0
+        
+        cd $WORK_DIR
+        
+        python pipeline_conversation_batched.py \
+            --ray-address=$HEAD_NODE_IP:$RAY_PORT \
+            --output-dir=$OUTPUT_DIR \
+            --prompt-file=$PROMPT_FILE \
+            --reference-voices=$REFERENCE_VOICES \
+            --num-conversations=$NUM_CONVERSATIONS \
+            --batch-size=$BATCH_SIZE \
+            --verbose \
+            --mfa-command='$MFA_COMMAND' \
+            --num-cpus=$TOTAL_CPUS \
+            --num-gpus=$TOTAL_GPUS \
+            $OPTIONAL_ARGS
+    "
+
+PIPELINE_EXIT_CODE=$?
+
+# =============================================================================
+# Step 5: Cleanup
+# =============================================================================
+echo ""
+echo "Step 5: Shutting down Ray cluster..."
+
+for NODE in $ALL_NODES; do
+    srun $SRUN_OPTS --overlap --nodes=1 --ntasks=1 -w "$NODE" \
+        --container-image="$CONTAINER_IMAGE" \
+        --container-mounts="$CONTAINER_MOUNTS" \
+        bash -c "
+            export PATH=/opt/micromamba/envs/py310/bin:\$PATH
+            pip install --no-cache-dir click==8.1.7 2>/dev/null
+            ray stop 2>/dev/null || true
+        " &
+done
+
+sleep 5
+
+echo "  Terminating background Ray processes..."
+kill $HEAD_PID $WORKER_PIDS 2>/dev/null || true
+
+wait 2>/dev/null || true
+
+echo "=============================================================================="
+if [ $PIPELINE_EXIT_CODE -eq 0 ]; then
+    echo "✅ Pipeline completed successfully!"
+else
+    echo "❌ Pipeline failed with exit code: $PIPELINE_EXIT_CODE"
+fi
+echo "=============================================================================="
+
+exit $PIPELINE_EXIT_CODE
+

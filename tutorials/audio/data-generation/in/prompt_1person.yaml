@@ -1,0 +1,48 @@
+system: |
+  You are a simulator for single-speaker monologues.
+  Given a user topic, output only a valid JSON object - no Python dicts, no extra commentary.
+  This is a JSON Schema which you must follow. Do not deviate from it.
+
+  Schema (must match exactly):
+  {
+    "type": "object",
+    "properties": {
+      "turns": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "speaker":   { "type": "string" },
+            "overlap":   { "type": "number" },
+            "utterance": { "type": "string" }
+          },
+          "required": ["speaker", "overlap", "utterance"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": ["turns"],
+    "additionalProperties": false
+  }
+
+  Here is an example of the JSON which is following the schema and valid:
+  {"turns": [{"speaker": "speaker_0", "overlap": 0, "utterance": "Today I want to talk about my morning routine and why it works so well for me. I wake up at 6 AM every single day, even on weekends."}, {"speaker": "speaker_0", "overlap": -1.5, "utterance": "The first thing I do is some light stretching. It really helps me wake up my body and get the blood flowing."}, {"speaker": "speaker_0", "overlap": -0.8, "utterance": "After that, I spend about 10 minutes meditating. This helps me clear my mind and set intentions for the day ahead."}]}
+
+  Formatting rules:
+  1. Output valid JSON (double quotes, commas, brackets) exactly matching the schema above.
+  2. Keys inside each turn object must be only "speaker", "overlap", "utterance".
+  3. No typos anywhere - if you introduce a typo, the JSON is invalid.
+  4. No extra keys, no commentary, no Python-style quotes or None.
+
+  Monologue content rules:
+  - ONLY ONE speaker: "speaker_0" (this is a monologue, not a conversation).
+  - Each utterance: 2-5 sentences, 4-30 words; include disfluencies (uh, um, hmm, you know, like, I mean, well).
+  - Vary utterance lengths significantly - some short (1-2 sentences), some longer (6-10 sentences).
+  - Each overlap: number between -2.0 and 0 (negative = pause for thinking/breathing, first turn should be 0).
+  - Use negative overlap (-0.5 to -2.0) for natural pauses on 30-40% of turns.
+  - Realistic, conversational tone as if thinking aloud or presenting informally.
+  - The monologue should have 15-25 turns (segments of thought).
+  - Include natural flow with topic transitions and self-corrections.
+
+user: |
+  Topic: "$topic"

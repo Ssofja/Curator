@@ -114,22 +114,18 @@ class ChatterboxTTSGeneration(ProcessingStage):
         self.current_conversation_id = None
         
         self.temp_dir = tempfile.mkdtemp(prefix="chatterbox_processed_audio_")
-        logger.info(f"Created temporary directory for processed audio: {self.temp_dir}")
         
         atexit.register(self._cleanup_temp_dir)
     
     def setup(self, worker_metadata=None):
         """Initialize the TTS model once when the worker starts."""
-        logger.info("Setting up ChatterboxTTSGeneration worker...")
-        self.prepare()  # Load model and reference voices
-        logger.info("ChatterboxTTSGeneration worker ready!")
+        self.prepare()
     
     def _cleanup_temp_dir(self):
         """Clean up temporary directory."""
         if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
             try:
                 shutil.rmtree(self.temp_dir)
-                logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
             except Exception as e:
                 logger.warning(f"Failed to clean up temporary directory {self.temp_dir}: {e}")
     
@@ -141,9 +137,7 @@ class ChatterboxTTSGeneration(ProcessingStage):
         try:
             from chatterbox.tts import ChatterboxTTS
             
-            logger.info("Loading ChatterboxTTS model...")
             self.model = ChatterboxTTS.from_pretrained(device=self.device)
-            logger.info("ChatterboxTTS model loaded successfully")
             
         except ImportError as e:
             logger.error("ChatterboxTTS not installed. Please install: pip install chatterbox-tts")
@@ -160,8 +154,6 @@ class ChatterboxTTSGeneration(ProcessingStage):
             
             if not self.reference_wavs_list:
                 raise ValueError(f"No reference audio files found in {self.reference_voices_dataset}/wavs/")
-            
-            logger.info(f"Found {len(self.reference_wavs_list)} reference audio files")
             
         except Exception as e:
             logger.error(f"Error loading reference audio files: {e}")
@@ -252,10 +244,6 @@ class ChatterboxTTSGeneration(ProcessingStage):
             
             sf.write(output_filepath, processed_audio, sample_rate)
             
-            logger.info(f"Processed reference audio (removed pauses): {output_filepath}")
-            logger.info(f"  Original duration: {len(audio_data) / sample_rate:.2f}s, "
-                       f"Extracted speech: {len(processed_audio) / sample_rate:.2f}s")
-            
             return output_filepath
             
         except Exception as e:
@@ -266,16 +254,8 @@ class ChatterboxTTSGeneration(ProcessingStage):
         """
         Get or assign reference audio file for a speaker.
         Maintains consistent voice across turns for the same speaker.
-        
-        Args:
-            speaker (str): Speaker identifier
-            already_assigned_references (set): Set of already assigned reference audio paths
-            
-        Returns:
-            str: Path to processed reference audio file (with pauses removed)
         """
         if speaker in self.speaker_to_reference:
-            logger.info(f"Using cached reference for speaker '{speaker}': {self.speaker_to_reference[speaker]}")
             return self.speaker_to_reference[speaker]
         
         available_wavs = [
@@ -284,49 +264,35 @@ class ChatterboxTTSGeneration(ProcessingStage):
         ]
         
         if not available_wavs:
-            logger.warning("All reference voices assigned, allowing reuse")
             available_wavs = self.reference_wavs_list
         
         selected_wav = random.choice(available_wavs)
-        logger.info(f"🎯 Random selection: chose from {len(available_wavs)} available voices")
         
         wav_parts = selected_wav.split(os.sep)
         dialog_id = wav_parts[-2]
         speaker_file = wav_parts[-1]
         speaker_id = os.path.splitext(speaker_file)[0]
         
-        logger.info(f"  📂 Selected: {dialog_id}/{speaker_id}")
-        
         rttm_path = os.path.join(self.reference_voices_dataset, "rttms", dialog_id, f"{speaker_id}.rttm")
         
         if os.path.exists(rttm_path):
             processed_audio = self._process_audio_with_rttm(selected_wav, rttm_path)
         else:
-            logger.warning(f"RTTM not found for {selected_wav}, using original audio")
             processed_audio = selected_wav
         
         self.speaker_to_reference[speaker] = processed_audio
-        logger.info(f"Assigned new reference for speaker '{speaker}': {processed_audio}")
         
         return processed_audio
     
     def _normalize_audio(self, wav: torch.Tensor, target_level: float = -20.0) -> torch.Tensor:
         """
         Normalize audio to target dB level to fix low volume issues in TTS output.
-        
-        Args:
-            wav: Audio tensor
-            target_level: Target loudness in dB (default -20 dB is good for speech)
-        
-        Returns:
-            Normalized audio tensor
         """
         wav_np = wav.numpy() if isinstance(wav, torch.Tensor) else wav
         
         rms = np.sqrt(np.mean(wav_np**2))
         
         if rms < 1e-10:
-            logger.warning("Audio is silent or near-silent, skipping normalization")
             return wav
         
         current_level_db = 20 * np.log10(rms)
@@ -339,26 +305,13 @@ class ChatterboxTTSGeneration(ProcessingStage):
         normalized_wav = np.tanh(normalized_wav * 0.9) / 0.9
         normalized_wav = np.clip(normalized_wav, -0.99, 0.99)
         
-        logger.debug(f"Volume normalization: {gain_db:+.2f} dB (before: {current_level_db:.2f} dB)")
-        
         return torch.from_numpy(normalized_wav).reshape(wav.shape)
     
     def _generate_audio_for_turn(self, text: str, speaker: str, reference_wav: str, conversation_id: str = "unknown") -> np.ndarray:
         """
         Generate audio for a single conversation turn using ChatterboxTTS.
-        
-        Args:
-            text (str): Text to synthesize
-            speaker (str): Speaker identifier
-            reference_wav (str): Path to reference audio for voice cloning
-            conversation_id (str): Conversation identifier for consistent exaggeration
-            
-        Returns:
-            np.ndarray: Generated audio as numpy array
         """
         try:
-            logger.info(f"Generating audio for speaker '{speaker}' (exag={self.exaggeration:.3f}): '{text[:50]}...'")
-            
             with torch.inference_mode():
                 wav = self.model.generate(
                     text,
@@ -391,8 +344,6 @@ class ChatterboxTTSGeneration(ProcessingStage):
     def process_dataset_entry(self, data_entry: Dict) -> Dict:
         """
         Generate audio for a single data entry (utterance).
-        Maintains speaker-to-voice consistency within each conversation.
-        Resets voices for new conversations to ensure variety across different dialogues.
         """
         if self.model is None:
             self.prepare()
@@ -402,25 +353,17 @@ class ChatterboxTTSGeneration(ProcessingStage):
         elif 'text' in data_entry:
             text = data_entry.get('text', '').strip()
         else:
-            logger.warning("No text or utterance found in data entry, skipping")
             raise ValueError(f"No text or utterance found in data entry '{data_entry}'")    
 
         speaker = data_entry.get('speaker', 'unknown')
         conversation_id = data_entry.get('conversation_id', 'unknown')
         
         if self.current_conversation_id != conversation_id:
-            if self.current_conversation_id is not None:
-                logger.info(f"🔄 New conversation detected ({conversation_id[:8]}...), resetting voice assignments")
-                logger.info(f"   Previous conversation: {self.current_conversation_id[:8]}...")
-                logger.info(f"   Speakers in previous conversation: {list(self.speaker_to_reference.keys())}")
-            
             self.speaker_to_reference = {}
             self.current_conversation_id = conversation_id
-            
-            logger.info(f"🎤 Starting new conversation: {conversation_id[:8]}...")
         
         if not text:
-            raise ValueError("Empty text found for speaker '{speaker}'")
+            raise ValueError(f"Empty text found for speaker '{speaker}'")
         
         try:
             already_assigned = set(self.speaker_to_reference.values())
@@ -452,10 +395,6 @@ class ChatterboxTTSGeneration(ProcessingStage):
                     if key not in updated_entry:
                         updated_entry[key] = value
             
-            elapsed = time.time() - start_time
-            logger.info(f"✅ Generated audio in {elapsed:.2f}s: {output_audio_path} "
-                       f"(duration: {updated_entry['duration']:.2f}s)")
-            
             return updated_entry
             
         except Exception as e:
@@ -472,7 +411,6 @@ class ChatterboxTTSGeneration(ProcessingStage):
         processed_data = []
         for entry in batch.data:
             if isinstance(entry, str) and os.path.isfile(entry):
-                logger.info(f"Reading manifest file: {entry}")
                 with open(entry, 'r') as f:
                     for line in f:
                         line = line.strip()

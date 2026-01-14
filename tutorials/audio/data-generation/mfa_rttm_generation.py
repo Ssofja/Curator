@@ -85,16 +85,7 @@ class MFAToRTTMGeneration(ProcessingStage):
         self.cleanup_temp_files = cleanup_temp_files
         self.text_field = text_field
         
-        # Create output directory
         self.rttm_output_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"MFAToRTTMGeneration initialized (using align_one for parallel processing)")
-        logger.info(f"  RTTM output directory: {self.rttm_output_dir}")
-        logger.info(f"  MFA command: {self.mfa_command}")
-        logger.info(f"  Acoustic model: {self.acoustic_model}")
-        logger.info(f"  Dictionary: {self.dictionary}")
-        logger.info(f"  Using {'phone' if self.use_phone_intervals else 'word'}-level intervals")
-        logger.info(f"  Max gap for merge: {self.max_gap_for_merge}s")
     
     def xenna_stage_spec(self) -> dict[str, Any]:
         """Allow parallel processing - Curator will determine num_workers automatically."""
@@ -103,8 +94,6 @@ class MFAToRTTMGeneration(ProcessingStage):
     def process(self, batch: AudioBatch) -> AudioBatch:
         """
         Process each entry in the batch individually using MFA align_one.
-        
-        This enables parallel processing as each entry is independent.
         """
         updated_entries = []
         
@@ -114,10 +103,8 @@ class MFAToRTTMGeneration(ProcessingStage):
                 updated_entries.append(updated_entry)
             except Exception as e:
                 logger.error(f"Error processing entry: {e}")
-                # Keep original entry if processing fails
                 updated_entries.append(entry)
         
-        logger.info(f"✅ MFA processing complete: {len(updated_entries)} entries processed")
         return AudioBatch(data=updated_entries)
     
     def _process_single_entry(self, entry: Dict) -> Dict:
@@ -191,7 +178,6 @@ class MFAToRTTMGeneration(ProcessingStage):
         """Run MFA align_one command on a single audio file."""
         
         try:
-            # Split mfa_command if it contains multiple parts (e.g., "micromamba run -n env mfa")
             mfa_cmd_parts = shlex.split(self.mfa_command)
             
             cmd = mfa_cmd_parts + [
@@ -205,8 +191,6 @@ class MFAToRTTMGeneration(ProcessingStage):
                 "--output_format", "long_textgrid"
             ]
             
-            logger.debug(f"Running MFA command: {' '.join(cmd)}")
-            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -219,7 +203,6 @@ class MFAToRTTMGeneration(ProcessingStage):
                 logger.error(f"STDERR: {result.stderr}")
                 return False
             
-            logger.debug(f"MFA alignment completed for {file_stem}")
             return True
             
         except Exception as e:
@@ -234,29 +217,17 @@ class MFAToRTTMGeneration(ProcessingStage):
     ) -> Path:
         """
         Convert a TextGrid file to RTTM format.
-        
-        Args:
-            textgrid_path: Path to TextGrid file
-            file_stem: File stem for RTTM naming
-            entry: Original manifest entry
-            
-        Returns:
-            Path to generated RTTM file
         """
         if textgrid is None:
             raise ImportError("TextGrid parsing library not available")
         
-        # Parse TextGrid
         try:
-            # Try praatio first
             if hasattr(textgrid, 'openTextgrid'):
                 tg = textgrid.openTextgrid(str(textgrid_path), includeEmptyIntervals=False)
-                # Get words or phones tier
                 tier_name = "phones" if self.use_phone_intervals else "words"
                 tier = tg.getTier(tier_name) if tier_name in tg.tierNames else tg.getTier(tg.tierNames[0])
                 intervals = [(entry_item.start, entry_item.end, entry_item.label) for entry_item in tier.entries]
             else:
-                # Try textgrid library
                 tg = textgrid.TextGrid.fromFile(str(textgrid_path))
                 tier_name = "phones" if self.use_phone_intervals else "words"
                 tier = tg.getFirst(tier_name) if tier_name else tg.tiers[0]
@@ -265,7 +236,6 @@ class MFAToRTTMGeneration(ProcessingStage):
             logger.error(f"Error parsing TextGrid {textgrid_path}: {e}")
             intervals = []
         
-        # Filter out empty intervals and silence markers
         silence_markers = {'', 'sp', 'sil', 'spn', '<eps>'}
         speech_intervals = []
         
@@ -276,18 +246,14 @@ class MFAToRTTMGeneration(ProcessingStage):
                     'duration': end - start
                 })
         
-        # Merge close intervals
         merged_intervals = self._merge_intervals(speech_intervals)
         
-        # Get speaker from entry
         speaker = entry.get('speaker', 'speaker_0')
         
-        # Generate RTTM file
         rttm_filepath = self.rttm_output_dir / f"{file_stem}.rttm"
         
         with open(rttm_filepath, 'w', encoding='utf-8') as f:
             for interval in merged_intervals:
-                # RTTM format: SPEAKER file_id channel start_time duration <NA> <NA> speaker_id <NA> <NA>
                 line = (
                     f"SPEAKER {file_stem} 1 "
                     f"{interval['start']:.3f} {interval['duration']:.3f} "
@@ -295,24 +261,15 @@ class MFAToRTTMGeneration(ProcessingStage):
                 )
                 f.write(line)
         
-        logger.debug(f"TextGrid->RTTM: {file_stem} | {len(speech_intervals)} intervals -> {len(merged_intervals)} segments")
-        
         return rttm_filepath
     
     def _merge_intervals(self, intervals: List[Dict]) -> List[Dict]:
         """
         Merge consecutive intervals into continuous speech segments.
-        
-        Args:
-            intervals: List of intervals with 'start' and 'duration'
-        
-        Returns:
-            List of merged speech segments
         """
         if not intervals:
             return []
         
-        # Sort by start time
         sorted_intervals = sorted(intervals, key=lambda x: x['start'])
         
         merged = []
@@ -324,14 +281,11 @@ class MFAToRTTMGeneration(ProcessingStage):
             interval_start = interval['start']
             interval_end = interval_start + interval['duration']
             
-            # Calculate gap between current segment end and next interval start
             gap = interval_start - current_end
             
             if gap <= self.max_gap_for_merge:
-                # Small gap or overlap - merge
                 current_end = max(current_end, interval_end)
             else:
-                # Large gap - finalize current segment and start new one
                 merged.append({
                     'start': current_start,
                     'duration': current_end - current_start
@@ -339,7 +293,6 @@ class MFAToRTTMGeneration(ProcessingStage):
                 current_start = interval_start
                 current_end = interval_end
         
-        # Add final segment
         merged.append({
             'start': current_start,
             'duration': current_end - current_start
