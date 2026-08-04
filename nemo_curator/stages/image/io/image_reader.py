@@ -33,7 +33,7 @@ class ImageReaderStage(ProcessingStage[FileGroupTask, ImageBatch]):
     otherwise falls back to CPU decoding.
     """
 
-    batch_size: int = 100
+    dali_batch_size: int = 100
     verbose: bool = True
     num_threads: int = 8
     num_gpus_per_worker: float = 0.25
@@ -68,7 +68,7 @@ class ImageReaderStage(ProcessingStage[FileGroupTask, ImageBatch]):
             raise RuntimeError(msg) from exc
 
         @pipeline_def(
-            batch_size=self.batch_size,
+            batch_size=self.dali_batch_size,
             num_threads=self.num_threads,
             device_id=0,  # First device; unused for CPU-only DALI builds
         )
@@ -98,11 +98,7 @@ class ImageReaderStage(ProcessingStage[FileGroupTask, ImageBatch]):
         # Use the tar filename stem as the id prefix for single shards; for grouped shards,
         # synthesize a group prefix and place generated image paths under the tars' parent dir.
         base_path = tar_paths[0] if len(tar_paths) == 1 else tar_paths[0].parent
-        id_prefix = (
-            tar_paths[0].stem
-            if len(tar_paths) == 1
-            else f"group_{tar_paths[0].stem}_x{len(tar_paths)}"
-        )
+        id_prefix = tar_paths[0].stem if len(tar_paths) == 1 else f"group_{tar_paths[0].stem}_x{len(tar_paths)}"
 
         while samples_completed < total_samples:
             img_batch = pipe.run()
@@ -133,9 +129,8 @@ class ImageReaderStage(ProcessingStage[FileGroupTask, ImageBatch]):
 
     def _stream_batches(self, tar_files: list[pathlib.Path]) -> Generator[ImageBatch, None, None]:
         """Emit one ImageBatch per DALI run across all provided tar files."""
-        for batch_id, image_objects in enumerate(self._read_tars_with_dali(tar_files)):
+        for _batch_id, image_objects in enumerate(self._read_tars_with_dali(tar_files)):
             yield ImageBatch(
-                task_id=f"image_batch_{batch_id}",
                 dataset_name="tar_files",
                 data=image_objects,
             )

@@ -13,6 +13,10 @@
 # limitations under the License.
 
 import argparse
+import re
+import shutil
+import subprocess
+import sys
 
 from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.pipeline import Pipeline
@@ -27,18 +31,6 @@ from nemo_curator.stages.video.embedding.cosmos_embed1 import (
     CosmosEmbed1EmbeddingStage,
     CosmosEmbed1FrameCreationStage,
 )
-
-try:
-    from nemo_curator.stages.video.embedding.internvideo2 import (
-        InternVideo2EmbeddingStage,
-        InternVideo2FrameCreationStage,
-    )
-except ImportError:
-    print("InternVideo2 is not installed")
-    InternVideo2EmbeddingStage = None
-    InternVideo2FrameCreationStage = None
-
-
 from nemo_curator.stages.video.filtering.clip_aesthetic_filter import ClipAestheticFilterStage
 from nemo_curator.stages.video.filtering.motion_filter import MotionFilterStage, MotionVectorDecodeStage
 from nemo_curator.stages.video.io.clip_writer import ClipWriterStage
@@ -169,24 +161,6 @@ def create_video_splitting_pipeline(args: argparse.Namespace) -> Pipeline:  # no
                     verbose=args.verbose,
                 )
             )
-        elif args.embedding_algorithm.startswith("internvideo2"):
-            if InternVideo2FrameCreationStage is None:
-                msg = "InternVideo2 is not installed, please consider installing it or using cosmos-embed1 instead."
-                raise ValueError(msg)
-            pipeline.add_stage(
-                InternVideo2FrameCreationStage(
-                    model_dir=args.model_dir,
-                    target_fps=2.0,
-                    verbose=args.verbose,
-                )
-            )
-            pipeline.add_stage(
-                InternVideo2EmbeddingStage(
-                    model_dir=args.model_dir,
-                    gpu_memory_gb=args.embedding_gpu_memory_gb,
-                    verbose=args.verbose,
-                )
-            )
         else:
             msg = f"Embedding algorithm {args.embedding_algorithm} not supported"
             raise ValueError(msg)
@@ -201,7 +175,6 @@ def create_video_splitting_pipeline(args: argparse.Namespace) -> Pipeline:  # no
                 window_size=args.captioning_window_size,
                 remainder_threshold=args.captioning_remainder_threshold,
                 preprocess_dtype=args.captioning_preprocess_dtype,
-                model_does_preprocess=args.captioning_model_does_preprocess,
                 generate_previews=args.generate_previews,
                 verbose=args.verbose,
             )
@@ -215,6 +188,7 @@ def create_video_splitting_pipeline(args: argparse.Namespace) -> Pipeline:  # no
                 )
             )
 
+        # All models now use the standard model_dir (auto-downloaded from HuggingFace)
         pipeline.add_stage(
             CaptionGenerationStage(
                 model_dir=args.model_dir,
@@ -222,7 +196,6 @@ def create_video_splitting_pipeline(args: argparse.Namespace) -> Pipeline:  # no
                 caption_batch_size=args.captioning_batch_size,
                 fp8=args.captioning_use_fp8_weights,
                 max_output_tokens=args.captioning_max_output_tokens,
-                model_does_preprocess=args.captioning_model_does_preprocess,
                 generate_stage2_caption=args.captioning_stage2_caption,
                 stage2_prompt_text=args.captioning_stage2_prompt_text,
                 disable_mmcache=not args.captioning_use_vllm_mmcache,
@@ -234,6 +207,7 @@ def create_video_splitting_pipeline(args: argparse.Namespace) -> Pipeline:  # no
                 CaptionEnhancementStage(
                     model_dir=args.model_dir,
                     model_variant=args.enhance_captions_algorithm,
+                    captioning_model_variant=args.captioning_algorithm,
                     prompt_variant=args.enhance_captioning_prompt_variant,
                     prompt_text=args.enhance_captions_prompt_text,
                     model_batch_size=args.enhance_captions_batch_size,
@@ -245,7 +219,7 @@ def create_video_splitting_pipeline(args: argparse.Namespace) -> Pipeline:  # no
 
     pipeline.add_stage(
         ClipWriterStage(
-            output_path=args.output_clip_path,
+            output_path=args.output_path,
             input_path=args.video_dir,
             upload_clips=args.upload_clips,
             dry_run=args.dry_run,
@@ -262,7 +236,57 @@ def create_video_splitting_pipeline(args: argparse.Namespace) -> Pipeline:  # no
     return pipeline
 
 
+# Encoders that produce h264 clip output. ClipWriter's metadata extraction
+# runs ffprobe in a CPU-only Ray actor, so it needs a software h264 decoder
+# (NVDEC-only h264 won't work without GPU visibility in that actor).
+_H264_PRODUCING_ENCODERS = frozenset({"h264_nvenc", "libopenh264"})
+
+# Matches the ` V..... h264 ` row in `ffmpeg -decoders`, excluding `h264_cuvid` etc.
+_H264_SW_DECODER_LINE = re.compile(r"^\s+V\S*\s+h264\s")
+
+
+def _h264_software_decoder_available() -> bool:
+    if shutil.which("ffmpeg") is None:
+        return False
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-decoders"],  # noqa: S607
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return False
+    return any(_H264_SW_DECODER_LINE.match(line) for line in out.splitlines())
+
+
+def _preflight_check_h264_decoder(encoder: str) -> None:
+    """Fail-fast if the chosen transcode encoder produces h264 but the system
+    ffmpeg lacks a software h264 decoder — ClipWriter would otherwise crash on
+    every transcoded clip in a CPU-only Ray actor.
+    """
+    if encoder not in _H264_PRODUCING_ENCODERS:
+        return
+    if _h264_software_decoder_available():
+        return
+    msg = (
+        f"\nERROR: --transcode-encoder={encoder} produces h264 clips, but the "
+        "container's ffmpeg does not include a software h264 decoder.\n"
+        "ClipWriter's metadata extraction (ffprobe in a CPU-only Ray actor) "
+        "will fail on every transcoded clip.\n\n"
+        "Fix one of:\n"
+        "  1. Install software h264/hevc/av1 decoders inside the container:\n"
+        "       bash /opt/Curator/docker/common/install_h264_support.sh\n"
+        "  2. Pick a transcode encoder whose output codec the system ffmpeg "
+        "can software-decode (e.g. --transcode-encoder libvpx-vp9).\n"
+    )
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
 def main(args: argparse.Namespace) -> None:
+    _preflight_check_h264_decoder(args.transcode_encoder)
     pipeline = create_video_splitting_pipeline(args)
 
     # Print pipeline description
@@ -280,8 +304,15 @@ def main(args: argparse.Namespace) -> None:
     print("\nPipeline completed!")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def create_video_splitting_argparser() -> argparse.ArgumentParser:  # noqa: PLR0915
+    """Create and return the argument parser for video splitting pipeline.
+
+    This function is extracted to allow reuse by other scripts (e.g., benchmarks).
+    """
+    parser = argparse.ArgumentParser(
+        description="Split videos into clips with optional embeddings, captions, and filtering.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     # General arguments
     parser.add_argument("--video-dir", type=str, required=True, help="Path to input video directory")
     parser.add_argument(
@@ -290,20 +321,22 @@ if __name__ == "__main__":
         default="./models",
         help=(
             "Path to model directory containing required model weights. "
-            "Models will be automatically downloaded on first use if not present. "
+            "Models will be automatically downloaded from HuggingFace on first use if not present. "
             "Required models depend on selected algorithms:\n"
             "  - TransNetV2: For scene detection (--splitting-algorithm transnetv2)\n"
-            "  - InternVideo2: For embeddings (--embedding-algorithm internvideo2)\n"
             "  - Cosmos-Embed1: For embeddings (--embedding-algorithm cosmos-embed1-*)\n"
-            "  - Qwen: For captioning (--generate-captions)\n"
+            "  - Qwen2.5-VL: For captioning (--captioning-algorithm qwen2.5)\n"
+            "  - Qwen3-VL: For captioning (--captioning-algorithm qwen3)\n"
+            "  - Nemotron Nano VL: For captioning (--captioning-algorithm nemotron[-bf16|-fp8|-nvfp4])\n"
+            "  - Nemotron 3 Nano Omni: For captioning (--captioning-algorithm nemotron-3-nano-omni)\n"
             "  - Aesthetic models: For filtering (--aesthetic-threshold)\n"
             "Default: ./models\n"
             "Example: --model-dir /path/to/models or --model-dir ./models"
-        )
+        ),
     )
     parser.add_argument("--video-limit", type=int, default=None, help="Limit the number of videos to read")
     parser.add_argument("--verbose", action="store_true", default=False)
-    parser.add_argument("--output-clip-path", type=str, help="Path to output clips", required=True)
+    parser.add_argument("--output-path", type=str, help="Path to output clips", required=True)
 
     parser.add_argument(
         "--no-upload-clips",
@@ -401,9 +434,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transcode-encoder",
         type=str,
-        default="libopenh264",
-        choices=["libopenh264", "h264_nvenc", "libx264"],
-        help="Codec for transcoding clips; None to skip transcoding.",
+        default="h264_nvenc",
+        choices=["h264_nvenc", "libvpx-vp9", "libopenh264"],
+        help=(
+            "Codec for transcoding clips. Use `h264_nvenc` on NVENC-equipped GPUs; "
+            "use `libvpx-vp9` (CPU) as a royalty-free fallback on GPUs without NVENC "
+            "such as A100/H100; `libopenh264` is accepted but requires a user-"
+            "installed FFmpeg build (Curator does not ship it — see the "
+            "Bring-Your-Own H.264 docs)."
+        ),
     )
     parser.add_argument(
         "--transcode-encoder-threads",
@@ -533,7 +572,7 @@ if __name__ == "__main__":
         "--embedding-algorithm",
         type=str,
         default="cosmos-embed1-224p",
-        choices=["cosmos-embed1-224p", "cosmos-embed1-336p", "cosmos-embed1-448p", "internvideo2"],
+        choices=["cosmos-embed1-224p", "cosmos-embed1-336p", "cosmos-embed1-448p"],
         help="Embedding algorithm to use.",
     )
     parser.add_argument(
@@ -578,9 +617,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--captioning-algorithm",
         type=str,
-        default="qwen",
-        choices=["qwen"],
-        help="Captioning algorithm to use in annotation pipeline.",
+        default="qwen2.5",
+        choices=[
+            "qwen2.5",
+            "qwen3",
+            "nemotron",
+            "nemotron-bf16",
+            "nemotron-fp8",
+            "nemotron-nvfp4",
+            "nemotron-3-nano-omni",
+        ],
+        help=(
+            "Captioning algorithm to use. Options:\n"
+            "  - qwen2.5: Qwen2.5-VL-7B-Instruct (default)\n"
+            "  - qwen3: Qwen3-VL-8B-Instruct\n"
+            "  - nemotron / nemotron-bf16: Nemotron Nano 12B v2 VL BF16 (auto-downloaded from HF)\n"
+            "  - nemotron-fp8: Nemotron Nano 12B v2 VL FP8 quantized\n"
+            "  - nemotron-nvfp4: Nemotron Nano 12B v2 VL NVFP4-QAD quantized\n"
+            "  - nemotron-3-nano-omni: Nemotron 3 Nano Omni"
+        ),
     )
     parser.add_argument(
         "--captioning-window-size",
@@ -627,39 +682,35 @@ if __name__ == "__main__":
             "bfloat16",
             "uint8",
         ],
-        help="Precision for tensor preprocess operations in QwenInputPreparationStage.",
-    )
-    parser.add_argument(
-        "--captioning-model-does-preprocess",
-        dest="captioning_model_does_preprocess",
-        action="store_true",
-        default=False,
-        help="If set, captioning model will handle preprocessing (resize, rescale, normalize) instead of our code.",
+        help="Raw frame dtype used before passing video frames to the vLLM multimodal processor.",
     )
     parser.add_argument(
         "--captioning-stage2-caption",
         dest="captioning_stage2_caption",
         action="store_true",
         default=False,
-        help="If set, generated captions are used as input prompts again into QwenVL to refine them",
+        help="If set, generated captions are refined with a second model pass (works for both Qwen and Nemotron)",
     )
     parser.add_argument(
         "--captioning-stage2-prompt-text",
         type=str,
         default=None,
-        help="Specify the input prompt used to generate stage2 Qwen captions",
+        help="Specify the prompt used for stage2 caption refinement.",
     )
     parser.add_argument(
         "--captioning-batch-size",
         type=int,
         default=8,
-        help="Batch size for Qwen captioning stage.",
+        help="Batch size for captioning stage (applies to both Qwen and Nemotron).",
     )
     parser.add_argument(
         "--captioning-use-fp8-weights",
         action="store_true",
         default=False,
-        help="Whether to use fp8 weights for Qwen VL model or not.",
+        help=(
+            "Whether to use fp8 weights for Qwen2.5/Qwen3 VL model. "
+            "Note: For Nemotron, use --captioning-algorithm nemotron-fp8 instead."
+        ),
     )
     parser.add_argument(
         "--captioning-max-output-tokens",
@@ -684,8 +735,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enhance-captions-algorithm",
         type=str,
-        default="qwen",
-        choices=["qwen"],
+        default="qwen2.5",
+        choices=["qwen2.5", "qwen3"],
         help="Caption enhancement algorithm to use.",
     )
     parser.add_argument(
@@ -730,5 +781,10 @@ if __name__ == "__main__":
         choices=["qwen_lm"],
         help="Enhanced LLM models to use to improve captions",
     )
+    return parser
+
+
+if __name__ == "__main__":
+    parser = create_video_splitting_argparser()
     args = parser.parse_args()
     main(args)

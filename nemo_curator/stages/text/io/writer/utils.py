@@ -12,10 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
+from collections.abc import Iterable, Iterator
+from itertools import islice
+from typing import Any
 
 
-def get_deterministic_hash(inputs: list[str], seed: str = "") -> str:
-    """Create a deterministic hash from inputs."""
-    combined = "|".join(sorted(inputs)) + "|" + seed
-    return hashlib.sha256(combined.encode()).hexdigest()[:12]
+def batched(iterable: Iterable[Any], n: int) -> Iterator[tuple[Any, ...]]:
+    """
+    Batch an iterable into lists of size n.
+
+    Args:
+      iterable (Iterable[Any]): The iterable to batch
+      n (int): The size of the batch
+
+    Returns:
+        Iterator[tuple[...]]: An iterator of tuples, each containing n elements from the iterable
+    """
+    if n < 1:
+        msg = "n must be at least one"
+        raise ValueError(msg)
+    it = iter(iterable)
+    while batch := tuple(islice(it, n)):
+        yield batch

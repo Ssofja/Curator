@@ -1,3 +1,5 @@
+# modality: text
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,30 +14,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ruff: noqa: E402
-
+from contextlib import suppress
 from pathlib import Path
 from typing import Literal
 
-import pytest
+# Suppress GPU-related import errors when running pytest -m "not gpu"
+with suppress(ImportError):
+    import cudf
 
-cudf = pytest.importorskip("cudf")
 import numpy as np
 import pandas as pd
+import pytest
 
-from nemo_curator.stages.deduplication.exact.workflow import ID_GENERATOR_OUTPUT_FILENAME, ExactDeduplicationWorkflow
-from nemo_curator.stages.deduplication.id_generator import (
-    CURATOR_DEDUP_ID_STR,
-    IdGeneratorBase,
-    create_id_generator_actor,
-    kill_id_generator_actor,
-)
+# Suppress GPU-related import errors when running pytest -m "not gpu"
+with suppress(ImportError):
+    from nemo_curator.stages.deduplication.exact.workflow import (
+        ID_GENERATOR_OUTPUT_FILENAME,
+        ExactDeduplicationWorkflow,
+    )
+    from nemo_curator.stages.deduplication.id_generator import (
+        CURATOR_DEDUP_ID_STR,
+        IdGeneratorBase,
+        create_id_generator_actor,
+        kill_id_generator_actor,
+    )
+
 from nemo_curator.tasks import FileGroupTask
 
 
 def get_original_df_with_curator_ids(
     id_generator_path: str, tasks: list[FileGroupTask], filetype: Literal["parquet", "jsonl"]
-) -> cudf.DataFrame:
+) -> "cudf.DataFrame":
     """Get mapping from curator IDs to original IDs using IDGeneratorActor.
 
     Args:
@@ -69,7 +78,6 @@ def exact_dedup_data_parquet(tmp_path: Path) -> list[FileGroupTask]:
 
     return [
         FileGroupTask(
-            task_id="exact_dedup_0",
             dataset_name="exact_dedup_dataset",
             data=[str(file1)],
             _metadata={
@@ -79,7 +87,6 @@ def exact_dedup_data_parquet(tmp_path: Path) -> list[FileGroupTask]:
             },
         ),
         FileGroupTask(
-            task_id="exact_dedup_1",
             dataset_name="exact_dedup_dataset",
             data=[str(file2)],
             _metadata={
@@ -100,7 +107,6 @@ def exact_no_dedup_data_jsonl(tmp_path: Path) -> list[FileGroupTask]:
 
     return [
         FileGroupTask(
-            task_id="no_dedup_0",
             dataset_name="no_dedup_dataset",
             data=[str(file1)],
             _metadata={
@@ -115,8 +121,14 @@ def exact_no_dedup_data_jsonl(tmp_path: Path) -> list[FileGroupTask]:
 @pytest.mark.gpu
 @pytest.mark.usefixtures("shared_ray_client")
 class TestExactDuplicatesWorkflow:
-    @pytest.mark.parametrize("assign_id", [True, False])
-    def test_dup(self, exact_dedup_data_parquet: list[FileGroupTask], tmpdir: Path, assign_id: bool) -> None:
+    @pytest.mark.parametrize(("assign_id", "identification_batchsize"), [(True, 1), (False, 3)])
+    def test_dup(
+        self,
+        exact_dedup_data_parquet: list[FileGroupTask],
+        tmpdir: Path,
+        assign_id: bool,
+        identification_batchsize: int,
+    ) -> None:
         workflow = ExactDeduplicationWorkflow(
             output_path=str(tmpdir),
             input_filetype="parquet",
@@ -124,8 +136,13 @@ class TestExactDuplicatesWorkflow:
             id_field="id" if not assign_id else None,
             text_field="text",
             perform_removal=False,
+            identification_batchsize=identification_batchsize,
         )
-        workflow.run(initial_tasks=exact_dedup_data_parquet)
+        result = workflow.run(initial_tasks=exact_dedup_data_parquet)
+        assert result.pipeline_tasks
+        assert result.get_metadata("total_time") > 0
+        expected_num_duplicates = 2
+        assert result.get_metadata("num_duplicates") == expected_num_duplicates
 
         original_df_with_curator_ids = (
             get_original_df_with_curator_ids(
@@ -145,6 +162,7 @@ class TestExactDuplicatesWorkflow:
         )
         removal_ids = set(removal_ids_df.id.to_arrow().to_pylist())
         duplicate_docs = [{1, -1}, {2, 4}]
+        assert len(removal_ids) == expected_num_duplicates
         # For every duplicate group assert that 1 document was not removed
         assert all(len(expected_group - removal_ids) == 1 for expected_group in duplicate_docs)
 
@@ -156,11 +174,40 @@ class TestExactDuplicatesWorkflow:
             text_field="content",
             perform_removal=False,
             input_path=str(tmpdir),
+            total_nparts=2,
+            rmm_pool_size=None,
+            spill_memory_limit="auto",
         )
-        workflow.run(initial_tasks=exact_no_dedup_data_jsonl)
+        result = workflow.run(initial_tasks=exact_no_dedup_data_jsonl)
+        assert result.pipeline_tasks
+        assert result.get_metadata("total_time") > 0
+        assert (result.get_metadata("num_duplicates") or 0) == 0
 
         removal_ids_df = cudf.read_parquet(tmpdir / "ExactDuplicateIds")
         assert len(removal_ids_df) == 0
+
+    def test_input_file_extensions_default_to_input_filetype(self, tmpdir: Path) -> None:
+        workflow = ExactDeduplicationWorkflow(
+            input_path="/dummy",
+            output_path=str(tmpdir),
+            input_filetype="jsonl",
+        )
+
+        stages = workflow._create_input_filegroups().stages
+
+        assert stages[0].file_extensions == [".jsonl", ".json"]
+
+    def test_input_file_extensions_override_default(self, tmpdir: Path) -> None:
+        workflow = ExactDeduplicationWorkflow(
+            input_path="/dummy",
+            output_path=str(tmpdir),
+            input_filetype="parquet",
+            input_file_extensions=[".pq"],
+        )
+
+        stages = workflow._create_input_filegroups().stages
+
+        assert stages[0].file_extensions == [".pq"]
 
     def test_bad_inputs(self, tmpdir: Path) -> None:
         with pytest.raises(NotImplementedError, match="Removal is not implemented"):

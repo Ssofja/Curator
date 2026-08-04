@@ -14,7 +14,7 @@
 
 from typing import Any, Literal
 
-from nemo_curator.backends.experimental.utils import RayStageSpecKeys
+from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.deduplication.shuffle_utils.rapidsmpf_shuffler import BulkRapidsMPFShuffler
 from nemo_curator.stages.resources import Resources
@@ -56,6 +56,9 @@ class ShuffleStage(ProcessingStage[FileGroupTask, FileGroupTask]):
 
     # Use BulkRapidsMPFShuffler directly
     actor_class = BulkRapidsMPFShuffler
+
+    # Shuffle reorders rows across partitions, so outputs aren't source-attributable.
+    is_resumable = False
 
     def __init__(  # noqa: PLR0913
         self,
@@ -130,7 +133,6 @@ class ShuffleStage(ProcessingStage[FileGroupTask, FileGroupTask]):
         partition_paths = self._actor_obj.extract_and_write(column_names=self.output_columns)
         return [
             FileGroupTask(
-                task_id=partition_id,
                 dataset_name=self.dataset_name + f"{self.name}",
                 data=[path],
                 _metadata={

@@ -1,3 +1,5 @@
+# modality: text
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,22 +14,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ruff: noqa: E402
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
-cudf = pytest.importorskip("cudf")
-cupy = pytest.importorskip("cupy")
-
-from nemo_curator.stages.deduplication.semantic.pairwise_io import ClusterWiseFilePartitioningStage
-from nemo_curator.tasks import FileGroupTask, _EmptyTask
+# Suppress GPU-related import errors when running pytest -m "not gpu"
+with suppress(ImportError):
+    from nemo_curator.stages.deduplication.semantic.pairwise_io import ClusterWiseFilePartitioningStage
+    from nemo_curator.tasks import EmptyTask, FileGroupTask
 
 
 @pytest.mark.gpu  # TODO : Remove this once we figure out how to import semantic on CPU
 class TestClusterWiseFilePartitioningStage:
     """Test cases for ClusterWiseFilePartitioningStage."""
+
+    def test_worker_defaults(self):
+        stage = ClusterWiseFilePartitioningStage("/test/path")
+
+        assert stage.num_workers() == 1
+        assert stage.ray_stage_spec()["is_fanout_stage"] is True
+        assert stage.xenna_stage_spec() == {}
 
     def test_setup(self):
         # Test fs and path_normalizer are set correctly
@@ -79,7 +87,7 @@ class TestClusterWiseFilePartitioningStage:
         mock_path_normalizer = Mock(side_effect=lambda x: x)
         stage.path_normalizer = mock_path_normalizer
 
-        empty_task = _EmptyTask(task_id="test", dataset_name="test", data=None)
+        empty_task = EmptyTask(dataset_name="test", data=None)
         result = stage.process(empty_task)
 
         # Verify path_normalizer was called exactly 3 times (once per centroid directory)
@@ -98,14 +106,11 @@ class TestClusterWiseFilePartitioningStage:
         result.sort(key=lambda x: x._metadata["centroid_id"])
 
         # Check each task
-        assert result[0].task_id == "pairwise_centroid_0"
         assert result[0]._metadata == {"centroid_id": 0, "filetype": "parquet"}
         assert result[0].data == [str(centroid_0_dir / "file1.parquet"), str(centroid_0_dir / "file2.parquet")]
 
-        assert result[1].task_id == "pairwise_centroid_1"
         assert result[1]._metadata == {"centroid_id": 1, "filetype": "parquet"}
         assert result[1].data == [str(centroid_1_dir / "file3.parquet")]
 
-        assert result[2].task_id == "pairwise_centroid_2"
         assert result[2]._metadata == {"centroid_id": 2, "filetype": "parquet"}
         assert result[2].data == [str(centroid_2_dir / "file4.parquet"), str(centroid_2_dir / "file5.parquet")]

@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
 
 from nemo_curator.backends.base import NodeInfo, WorkerMetadata
-from nemo_curator.models.qwen_lm import QwenLM
+from nemo_curator.models.qwen_lm import _QWEN_LM_VARIANTS_INFO, QwenLM
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks.video import Clip, Video, VideoTask, _Window
@@ -45,11 +45,13 @@ class CaptionEnhancementStage(ProcessingStage[VideoTask, VideoTask]):
     """
 
     model_dir: str = "models/qwen"
-    model_variant: str = "qwen"
+    model_variant: str = "qwen2.5"
+    captioning_model_variant: str = "qwen2.5"
     prompt_variant: str = "default"
     prompt_text: str | None = None
     model_batch_size: int = 128
     fp8: bool = False
+    vllm_kwargs: dict[str, Any] = field(default_factory=dict)
     max_output_tokens: int = 512
     verbose: bool = False
     name: str = "caption_enhancement"
@@ -67,13 +69,15 @@ class CaptionEnhancementStage(ProcessingStage[VideoTask, VideoTask]):
             self.prompt_text,
         )
 
-    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
-        if self.model_variant == "qwen":
+    def _initialize_model(self) -> None:
+        if self.model_variant in _QWEN_LM_VARIANTS_INFO:
             self.model = QwenLM(
                 model_dir=self.model_dir,
+                model_variant=self.model_variant,
                 caption_batch_size=self.model_batch_size,
                 fp8=self.fp8,
                 max_output_tokens=self.max_output_tokens,
+                **self.vllm_kwargs,
             )
         else:
             msg = f"Unsupported model variant: {self.model_variant}"
@@ -81,8 +85,13 @@ class CaptionEnhancementStage(ProcessingStage[VideoTask, VideoTask]):
         self.model.setup()
 
     def setup_on_node(self, node_info: NodeInfo, worker_metadata: WorkerMetadata) -> None:  # noqa: ARG002
-        """Download the weights for the QwenLM model on the node."""
-        QwenLM.download_weights_on_node(self.model_dir)
+        """Download weights and initialize vLLM once per node to avoid torch.compile race conditions."""
+        QwenLM.download_weights_on_node(self.model_dir, variant=self.model_variant)
+        self._initialize_model()
+
+    def setup(self, worker_metadata: WorkerMetadata | None = None) -> None:  # noqa: ARG002
+        if not hasattr(self, "model") or self.model is None:
+            self._initialize_model()
 
     def process(self, task: VideoTask) -> VideoTask:
         video = task.data
@@ -109,7 +118,7 @@ class CaptionEnhancementStage(ProcessingStage[VideoTask, VideoTask]):
                 if not self._is_valid_window_caption(clip, window, window_idx):
                     continue
 
-                caption = window.caption["qwen"]
+                caption = window.caption[self.captioning_model_variant]
                 if caption is None:
                     logger.error(f"Clip {clip.uuid} window {window_idx} has no caption")
                     continue
@@ -131,7 +140,7 @@ class CaptionEnhancementStage(ProcessingStage[VideoTask, VideoTask]):
             clip.errors[f"window-{window_idx}"] = "empty"
             return False
 
-        return "qwen" in window.caption
+        return self.captioning_model_variant in window.caption
 
     def _generate_and_assign_captions(
         self, video: Video, mapping: dict[int, tuple[int, int]], inputs: list[dict[str, Any]]
@@ -147,7 +156,7 @@ class CaptionEnhancementStage(ProcessingStage[VideoTask, VideoTask]):
 
         for idx, result in enumerate(captions):
             clip_idx, window_idx = mapping[idx]
-            original_caption = video.clips[clip_idx].windows[window_idx].caption["qwen"]
+            original_caption = video.clips[clip_idx].windows[window_idx].caption[self.captioning_model_variant]
             video.clips[clip_idx].windows[window_idx].enhanced_caption["qwen_lm"] = result
 
             if self.verbose:

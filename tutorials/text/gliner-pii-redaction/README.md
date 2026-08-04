@@ -13,3 +13,7 @@ Additionally, the tutorial uses the [GLiNER](https://github.com/urchade/GLiNER) 
 ```bash
 uv pip install gliner
 ```
+
+For reference, this tutorial was tested with `gliner==0.2.24`.
+
+Since the `gliner_pii_redaction.ipynb` notebook uses the `GlinerPiiRedactor` class from `gliner_pii_redactor.py`, the user should `cd /path/to/Curator/tutorials/text/gliner-pii-redaction` to ensure that the module is importable.

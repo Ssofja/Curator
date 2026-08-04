@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG NEMO_CURATOR_IMAGE=nemo_curator
-FROM ${NEMO_CURATOR_IMAGE} AS nemo_curator_benchmarking
+ARG CURATOR_IMAGE=nemo_curator
+FROM ${CURATOR_IMAGE} AS nemo_curator_benchmarking
 
 # Add system utilities useful for benchmark and debug
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     less \
+    lynx \
     openssh-client \
     vim \
     wget \
@@ -26,17 +27,13 @@ RUN apt-get update \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-# Add dependencies for benchmarking to the Curator Python environment
+# Add video benchmark codec support to the benchmark image.
+RUN bash /opt/Curator/docker/common/install_h264_support.sh --with-libopenh264
+
+# Ensure all extras and dependency groups (including test) are synced
 RUN cd /opt/Curator \
- && uv sync --extra all \
- && uv add \
-    GitPython \
-    oauth2client \
-    pydrive2 \
-    pynvml \
-    pyyaml \
-    rich \
-  && uv cache prune
+ && uv sync --extra all --all-groups \
+ && uv cache prune
 
 # Add the Curator repo to the safe.directory list to avoid GitPython warnings
 RUN git config --global --add safe.directory /opt/Curator

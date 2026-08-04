@@ -1,3 +1,5 @@
+# modality: text
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +15,7 @@
 # limitations under the License.
 
 import os
+from contextlib import suppress
 from pathlib import Path
 
 import pandas as pd
@@ -23,9 +26,9 @@ import pytest
 from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
 from nemo_curator.tasks import FileGroupTask
 
-BucketsToEdgesStage = pytest.importorskip(
-    "nemo_curator.stages.deduplication.fuzzy.buckets_to_edges"
-).BucketsToEdgesStage
+# Suppress GPU-related import errors when running pytest -m "not gpu"
+with suppress(ImportError):
+    from nemo_curator.stages.deduplication.fuzzy.buckets_to_edges import BucketsToEdgesStage
 
 
 @pytest.fixture
@@ -78,7 +81,6 @@ def sample_files(tmp_path: Path, sample_bucket_data: tuple[pd.DataFrame, pd.Data
 def input_task(sample_files: list[str]) -> FileGroupTask:
     """Create a FileGroupTask from sample files."""
     return FileGroupTask(
-        task_id="test_task",
         dataset_name="test_buckets",
         data=sample_files,
         _metadata={"batch_id": 0, "total_batches": 1},
@@ -94,7 +96,7 @@ class TestBucketsToEdgesStage:
         """Test basic edge creation from bucket data."""
         stage = BucketsToEdgesStage(
             output_path=str(tmp_path / "output"),
-            doc_id_field=CURATOR_DEDUP_ID_STR,
+            document_id_field=CURATOR_DEDUP_ID_STR,
         )
 
         # Process the task
@@ -160,7 +162,6 @@ class TestBucketsToEdgesStage:
         pq.write_table(table, file)
 
         input_task = FileGroupTask(
-            task_id="test_task_custom",
             dataset_name="test_buckets_custom",
             data=[str(file)],
             _metadata={"batch_id": 0, "total_batches": 1},
@@ -168,7 +169,7 @@ class TestBucketsToEdgesStage:
 
         stage = BucketsToEdgesStage(
             output_path=str(tmp_path / "output"),
-            doc_id_field="custom_doc_id",
+            document_id_field="custom_doc_id",
         )
 
         output_task = stage.process(input_task)
@@ -203,7 +204,6 @@ class TestBucketsToEdgesStage:
         pq.write_table(table, input_file)
 
         input_task = FileGroupTask(
-            task_id="empty_test",
             dataset_name="empty_buckets",
             data=[str(input_file)],
             _metadata={},
@@ -211,7 +211,7 @@ class TestBucketsToEdgesStage:
 
         stage = BucketsToEdgesStage(
             output_path=str(tmp_path / "output"),
-            doc_id_field=CURATOR_DEDUP_ID_STR,
+            document_id_field=CURATOR_DEDUP_ID_STR,
         )
 
         output_task = stage.process(input_task)
@@ -239,7 +239,6 @@ class TestBucketsToEdgesStage:
         pq.write_table(table, input_file)
 
         input_task = FileGroupTask(
-            task_id="single_doc_test",
             dataset_name="single_doc_buckets",
             data=[str(input_file)],
             _metadata={},
@@ -247,7 +246,7 @@ class TestBucketsToEdgesStage:
 
         stage = BucketsToEdgesStage(
             output_path=str(tmp_path / "output"),
-            doc_id_field=CURATOR_DEDUP_ID_STR,
+            document_id_field=CURATOR_DEDUP_ID_STR,
         )
 
         output_task = stage.process(input_task)
@@ -272,7 +271,6 @@ class TestBucketsToEdgesStage:
         pq.write_table(table, input_file)
 
         input_task = FileGroupTask(
-            task_id="large_bucket_test",
             dataset_name="large_buckets",
             data=[str(input_file)],
             _metadata={},
@@ -280,7 +278,7 @@ class TestBucketsToEdgesStage:
 
         stage = BucketsToEdgesStage(
             output_path=str(tmp_path / "output"),
-            doc_id_field=CURATOR_DEDUP_ID_STR,
+            document_id_field=CURATOR_DEDUP_ID_STR,
         )
 
         output_task = stage.process(input_task)
@@ -309,7 +307,7 @@ class TestBucketsToEdgesStage:
 
         stage = BucketsToEdgesStage(
             output_path=str(output_dir),
-            doc_id_field=CURATOR_DEDUP_ID_STR,
+            document_id_field=CURATOR_DEDUP_ID_STR,
         )
 
         assert not existing_file.exists()

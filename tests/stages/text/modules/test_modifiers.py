@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,24 +15,23 @@
 import pandas as pd
 import pytest
 
-from nemo_curator.stages.text.modifiers import (
-    DocumentModifier,
+from nemo_curator.stages.text.modifiers import DocumentModifier, Modify
+from nemo_curator.stages.text.modifiers.modifier import _normalize_input_fields, _normalize_output_fields
+from nemo_curator.stages.text.modifiers.string import (
     LineRemover,
     MarkdownRemover,
     NewlineNormalizer,
     QuotationRemover,
     Slicer,
-    UnicodeReformatter,
     UrlRemover,
 )
-from nemo_curator.stages.text.modules import Modify
-from nemo_curator.stages.text.modules.modifier import _normalize_input_fields, _normalize_output_fields
+from nemo_curator.stages.text.modifiers.unicode import UnicodeReformatter
 from nemo_curator.tasks import DocumentBatch
 
 
 def list_to_doc_batch(documents: list[str], col_name: str = "text") -> DocumentBatch:
     df = pd.DataFrame({col_name: documents})
-    return DocumentBatch(data=df, task_id="test_id", dataset_name="test_ds")
+    return DocumentBatch(data=df, dataset_name="test_ds")
 
 
 def run_modify(modifier: DocumentModifier, doc_batch: DocumentBatch) -> DocumentBatch:
@@ -565,7 +564,7 @@ class TestModifyIOAndMultiInput:
             return f"{a}-{b}"
 
         df = pd.DataFrame({"a": ["x", "hello"], "b": ["y", "world"]})
-        batch = DocumentBatch(task_id="t", dataset_name="ds", data=df)
+        batch = DocumentBatch(dataset_name="ds", data=df)
 
         m = Modify(join, input_fields=[["a", "b"]], output_fields="joined")
         m.setup()
@@ -592,7 +591,7 @@ class TestModifyIOAndMultiInput:
             return a + b
 
         df = pd.DataFrame({"a": [" a ", "b "], "b": ["x", "y"]})
-        batch = DocumentBatch(task_id="t", dataset_name="ds", data=df)
+        batch = DocumentBatch(dataset_name="ds", data=df)
 
         m = Modify(
             [strip_a, concat],

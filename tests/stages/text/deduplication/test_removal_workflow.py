@@ -20,8 +20,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from nemo_curator.backends.experimental.ray_data import RayDataExecutor
+from nemo_curator.backends.ray_data import RayDataExecutor
 from nemo_curator.backends.xenna import XennaExecutor
+from nemo_curator.pipeline.workflow import WorkflowRunResult
 from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
 from nemo_curator.stages.text.deduplication.removal import TextDuplicatesRemovalStage
@@ -84,6 +85,7 @@ class TestTextDuplicateRemovalWorkflowIntegration:
     output_dir: Path | None = None
     expected_input_df: pd.DataFrame | None = None
     ids_to_remove: list[int] | None = None
+    workflow_output: WorkflowRunResult | None = None
     output_tasks: list[DocumentBatch] | None = None
 
     @pytest.fixture
@@ -113,20 +115,26 @@ class TestTextDuplicateRemovalWorkflowIntegration:
             output_path=str(self.output_dir),
             input_filetype="parquet",
             output_filetype="parquet",
-            input_id_field=CURATOR_DEDUP_ID_STR,
-            ids_to_remove_duplicate_id_field="id",
+            id_field=CURATOR_DEDUP_ID_STR,
+            duplicate_id_field="id",
             input_kwargs={},
-            ids_to_remove_read_kwargs={},
+            duplicate_id_read_kwargs={},
             output_kwargs={},
         )
 
         executor = executor_cls(config)
-        self.output_tasks = workflow.run(executor)
+        workflow_output = workflow.run(executor)
+        self.workflow_output = workflow_output
+        # Extract tasks from the "removal" pipeline
+        self.output_tasks = workflow_output.pipeline_tasks.get("removal", [])
 
         return self
 
     def test_output_correctness_and_files(self, test_config: "TestTextDuplicateRemovalWorkflowIntegration"):
         """Test output correctness and file system integrity."""
+        assert test_config.workflow_output is not None
+        assert test_config.workflow_output.pipeline_tasks
+        assert test_config.workflow_output.get_metadata("total_time") > 0
         assert test_config.output_tasks is not None
         assert test_config.expected_input_df is not None
         assert test_config.ids_to_remove is not None
@@ -180,6 +188,9 @@ class TestTextDuplicateRemovalWorkflowIntegration:
         # Total records across all files should match combined total
         assert total_records == 800
 
+        # Metadata summaries should agree with observed behavior
+        assert test_config.workflow_output.get_metadata("num_duplicates_removed") == 200
+
     def test_metadata_num_removed_consistency(self, test_config: "TestTextDuplicateRemovalWorkflowIntegration"):
         """Test that num_removed metadata sums up correctly across all tasks."""
         assert test_config.output_tasks is not None
@@ -194,6 +205,8 @@ class TestTextDuplicateRemovalWorkflowIntegration:
         expected_total_removed = 200  # 2 * 100 files
 
         assert total_removed_from_metadata == expected_total_removed
+        assert test_config.workflow_output is not None
+        assert test_config.workflow_output.get_metadata("num_duplicates_removed") == expected_total_removed
 
         # Also verify by checking the actual difference in record counts
         total_input_records = len(test_config.expected_input_df)
@@ -215,7 +228,7 @@ class TestTextDuplicateRemovalWorkflowIntegration:
         initial_tasks = []
         for i in range(0, len(test_config.input_file_paths), 5):
             task_files = test_config.input_file_paths[i : i + 5]
-            initial_tasks.append(FileGroupTask(task_id=f"file_group_{i // 5}", dataset_name="input", data=task_files))
+            initial_tasks.append(FileGroupTask(dataset_name="input", data=task_files))
 
         assert len(initial_tasks) == 20  # 100 files / 5 per group = 20 tasks
 
@@ -228,18 +241,19 @@ class TestTextDuplicateRemovalWorkflowIntegration:
             ),  # Different output dir to avoid conflicts
             input_filetype="parquet",
             output_filetype="parquet",
-            input_id_field=CURATOR_DEDUP_ID_STR,
-            ids_to_remove_duplicate_id_field="id",
+            id_field=CURATOR_DEDUP_ID_STR,
+            duplicate_id_field="id",
             input_task_limit=10,  # truncate to 10 tasks only
             input_kwargs={},
-            ids_to_remove_read_kwargs={},
+            duplicate_id_read_kwargs={},
             output_kwargs={},
         )
 
         executor = test_config.executor_cls(test_config.config)
-        output_tasks = workflow.run(executor, initial_tasks=initial_tasks)
+        workflow_output = workflow.run(executor, initial_tasks=initial_tasks)
+        output_tasks = workflow_output.pipeline_tasks.get("removal", [])
 
-        # Verify we get 20 output tasks (one per input task)
+        # Verify we get 20 output tasks (one per input task) after truncation
         assert len(output_tasks) == 10, (
             f"Expected 10 output tasks, got {len(output_tasks)} for {test_config.executor_cls.__name__}"
         )
@@ -263,8 +277,42 @@ class TestTextDuplicateRemovalWorkflowIntegration:
             f"Column mismatch for {test_config.executor_cls.__name__}"
         )
 
+        expected_removed = 100  # 10 truncated tasks * 5 files/task * 2 removals per file
+        assert workflow_output.get_metadata("num_duplicates_removed") == expected_removed
+
+
+
+def test_removal_stage_can_drop_id_field(tmp_path: Path):
+    ids_to_remove_path = tmp_path / "ids_to_remove.parquet"
+    pd.DataFrame({"id": [1]}).to_parquet(ids_to_remove_path, index=False)
+    task = DocumentBatch(
+        dataset_name="dataset",
+        data=pd.DataFrame({CURATOR_DEDUP_ID_STR: [1, 2], "text": ["drop", "keep"]}),
+    )
+
+    stage = TextDuplicatesRemovalStage(
+        ids_to_remove_path=str(ids_to_remove_path),
+        id_field=CURATOR_DEDUP_ID_STR,
+        drop_id_field=True,
+    )
+
+    result = stage.process(task).to_pandas()
+
+    assert result.to_dict(orient="list") == {"text": ["keep"]}
+    assert CURATOR_DEDUP_ID_STR not in result.columns
+
 
 class TestTextDuplicatesRemovalWorkflowGenerateStages:
+    def test_drop_id_field_conflicts_with_output_fields(self):
+        with pytest.raises(ValueError, match="Cannot drop id_field"):
+            TextDuplicatesRemovalWorkflow(
+                input_path="input_path",
+                ids_to_remove_path="ids_to_remove_path",
+                output_path="output_path",
+                output_fields=["text", CURATOR_DEDUP_ID_STR],
+                drop_id_field=True,
+            )
+
     def test_invalid_filetypes(self):
         read_invalid_file_type_workflow = TextDuplicatesRemovalWorkflow(
             input_path="input_path",
@@ -286,16 +334,24 @@ class TestTextDuplicatesRemovalWorkflowGenerateStages:
         with pytest.raises(ValueError, match="Invalid output filetype: invalid"):
             write_invalid_file_type_workflow._generate_stages(initial_tasks=None)
 
-    @pytest.mark.parametrize("input_filetype", ["parquet", "jsonl"])
+    @pytest.mark.parametrize(
+        ("input_filetype", "expected_file_extensions"),
+        [("parquet", [".parquet"]), ("jsonl", [".jsonl", ".json"])],
+    )
     @pytest.mark.parametrize("id_generator_path", [None, "id_generator_path"])
-    def test_reader_stage(self, input_filetype: str, id_generator_path: str | None):
+    def test_reader_stage(
+        self,
+        input_filetype: str,
+        expected_file_extensions: list[str],
+        id_generator_path: str | None,
+    ):
         workflow = TextDuplicatesRemovalWorkflow(
             input_path="input_path",
             ids_to_remove_path="ids_to_remove_path",
             output_path="output_path",
             input_filetype=input_filetype,
             id_generator_path=id_generator_path,
-            input_id_field=CURATOR_DEDUP_ID_STR,
+            id_field=CURATOR_DEDUP_ID_STR,
         )
 
         stages = workflow._generate_stages(initial_tasks=None)
@@ -305,8 +361,7 @@ class TestTextDuplicatesRemovalWorkflowGenerateStages:
         assert stages[0].file_paths == "input_path"
         assert stages[0].files_per_partition is None
         assert stages[0].blocksize is None
-        # post init of FilePartitioningStage sets this
-        assert stages[0].file_extensions == [".jsonl", ".json", ".parquet"]
+        assert stages[0].file_extensions == expected_file_extensions
         assert stages[0].storage_options == {}
 
         # test for reader stage (stages[1])
@@ -323,9 +378,24 @@ class TestTextDuplicatesRemovalWorkflowGenerateStages:
         assert stages[2].id_field == CURATOR_DEDUP_ID_STR
         assert stages[2].duplicate_id_field == "id"
         assert stages[2].read_kwargs == {}
+        assert not stages[2].drop_id_field
 
         # test for writer stage (stages[3]) - default output_filetype is parquet
         assert isinstance(stages[3], ParquetWriter)
+
+    def test_reader_stage_with_custom_input_file_extensions(self):
+        workflow = TextDuplicatesRemovalWorkflow(
+            input_path="input_path",
+            ids_to_remove_path="ids_to_remove_path",
+            output_path="output_path",
+            input_filetype="parquet",
+            input_file_extensions=[".pq"],
+            id_generator_path=None,
+        )
+
+        stages = workflow._generate_stages(initial_tasks=None)
+
+        assert stages[0].file_extensions == [".pq"]
 
     @pytest.mark.parametrize("output_filetype", ["parquet", "jsonl"])
     def test_writer_stage(self, output_filetype: str):
@@ -335,6 +405,7 @@ class TestTextDuplicatesRemovalWorkflowGenerateStages:
             output_path="output_path",
             output_filetype=output_filetype,
             id_generator_path=None,
+            drop_id_field=True,
         )
         stages = workflow._generate_stages(initial_tasks=None)
         assert len(stages) == 4
@@ -342,6 +413,7 @@ class TestTextDuplicatesRemovalWorkflowGenerateStages:
         # reader stage
         assert isinstance(stages[1], ParquetReaderStage)  # Default input_filetype is parquet
         assert isinstance(stages[2], TextDuplicatesRemovalStage)
+        assert stages[2].drop_id_field
         expected_write_stage = ParquetWriter if output_filetype == "parquet" else JsonlWriter
         assert isinstance(stages[3], expected_write_stage)
 

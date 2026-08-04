@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,19 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .audio_batch import AudioBatch
+from .audio_task import AudioTask
 from .document import DocumentBatch
 from .file_group import FileGroupTask
 from .image import ImageBatch, ImageObject
-from .tasks import EmptyTask, Task, _EmptyTask
+from .interleaved import InterleavedBatch
+from .lance import LanceReadTask
+from .sentinels import EmptyTask, FailedTask, NoneTask, SentinelTask
+from .tasks import Task
 
 __all__ = [
-    "AudioBatch",
+    "AudioTask",
     "DocumentBatch",
     "EmptyTask",
+    "FailedTask",
     "FileGroupTask",
     "ImageBatch",
     "ImageObject",
+    "InterleavedBatch",
+    "LanceReadTask",
+    "NoneTask",
+    "SentinelTask",
     "Task",
-    "_EmptyTask",
 ]

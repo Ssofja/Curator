@@ -12,28 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 from loguru import logger
 
 from nemo_curator.backends.base import WorkerMetadata
+from nemo_curator.backends.utils import RayStageSpecKeys
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks.video import VideoTask
+from nemo_curator.utils.nvcodec_utils import _PYNVC_AVAILABLE, PyNvcFrameExtractor
 from nemo_curator.utils.operation_utils import make_pipeline_named_temporary_file
-
-try:
-    from nemo_curator.utils.nvcodec_utils import PyNvcFrameExtractor
-
-    _PYNVC_AVAILABLE = True
-except (ImportError, RuntimeError):
-    logger.warning("PyNvcFrameExtractor not available, PyNvCodec mode will fall back to FFmpeg")
-    PyNvcFrameExtractor = None
-    _PYNVC_AVAILABLE = False
 
 
 def get_frames_from_ffmpeg(
@@ -108,6 +103,9 @@ class VideoFrameExtractionStage(ProcessingStage[VideoTask, VideoTask]):
     decoder_mode: str = "pynvc"
     verbose: bool = False
     name: str = "video_frame_extraction"
+    ray_data_num_cpus: float | None = (
+        None  # CPU reservation for Ray Data scheduler; set to 1.0 on CPU path to enable stage fusion
+    )
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -122,8 +120,12 @@ class VideoFrameExtractionStage(ProcessingStage[VideoTask, VideoTask]):
         Args:
             worker_metadata (WorkerMetadata, optional): Information about the worker (provided by some backends)
         """
+        uses_ffmpeg = self.decoder_mode != "pynvc" or not _PYNVC_AVAILABLE
+        if uses_ffmpeg and not shutil.which("ffmpeg"):
+            msg = "VideoFrameExtractionStage requires 'ffmpeg' built with libopenh264/NVENC support. See docker/common/install_ffmpeg.sh."
+            raise RuntimeError(msg)
         if self.decoder_mode == "pynvc":
-            if _PYNVC_AVAILABLE and PyNvcFrameExtractor is not None:
+            if _PYNVC_AVAILABLE:
                 self.pynvc_frame_extractor = PyNvcFrameExtractor(
                     width=self.output_hw[1],
                     height=self.output_hw[0],
@@ -138,6 +140,16 @@ class VideoFrameExtractionStage(ProcessingStage[VideoTask, VideoTask]):
             self.resources = Resources(gpu_memory_gb=10)
         else:
             self.resources = Resources(cpus=4.0)
+            if self.ray_data_num_cpus is None:
+                # Default to 1.0 so Ray Data fuses this stage with VideoReaderStage.
+                # Kept separate from resources.cpus so Xenna scheduling is unaffected.
+                self.ray_data_num_cpus = 1.0
+
+    def ray_stage_spec(self) -> dict[str, Any]:
+        """Ray stage specification for this stage."""
+        if self.ray_data_num_cpus is not None:
+            return {RayStageSpecKeys.RAY_NUM_CPUS: self.ray_data_num_cpus}
+        return {}
 
     def process(self, task: VideoTask) -> VideoTask:
         width, height = self.output_hw

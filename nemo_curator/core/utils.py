@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,10 +13,14 @@
 # limitations under the License.
 
 import os
+import shutil
 import socket
 import subprocess
+import time
 from typing import TYPE_CHECKING
 
+import pyarrow as pa
+import pyarrow.compute as pc
 import ray
 from loguru import logger
 
@@ -25,10 +29,70 @@ from nemo_curator.core.constants import (
     DEFAULT_RAY_DASHBOARD_METRIC_PORT,
     DEFAULT_RAY_MAX_WORKER_PORT,
     DEFAULT_RAY_MIN_WORKER_PORT,
+    DEFAULT_RAY_SERVE_HAPROXY_METRICS_PORT,
+    RAY_CLUSTER_START_VERIFICATION_TIMEOUT,
 )
 
 if TYPE_CHECKING:
     import loguru
+
+
+def ignore_ray_head_node() -> bool:
+    """Return True if ``CURATOR_IGNORE_RAY_HEAD_NODE`` is set to a truthy value.
+
+    Used by both the pipeline executors (to skip the head node when scheduling
+    stage actors) and the inference-server backends (to emit a worker-only
+    bundle-label selector on placement groups).
+    """
+    return os.environ.get("CURATOR_IGNORE_RAY_HEAD_NODE", "").strip().lower() in ("1", "true", "yes")
+
+
+def check_ray_responsive(timeout_s: int = RAY_CLUSTER_START_VERIFICATION_TIMEOUT) -> bool:
+    # Assume the env var RAY_ADDRESS is set to the correct value by code starting the Ray cluster
+    logger.debug(f"Verifying Ray cluster is responsive, using RAY_ADDRESS={os.environ.get('RAY_ADDRESS')}")
+
+    responsive = False
+    timer = 0
+    t0 = time.time()
+    while not responsive and (timer < timeout_s):
+        try:
+            logger.debug("running 'ray status' command")
+            result = subprocess.run(
+                ["ray", "status"],  # noqa: S607
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=10,
+            )
+
+            # Clean stdout to remove any new lines and carriage returns
+            result.stdout = result.stdout.replace("\n", "").replace("\r", "")
+            if "No cluster status" in result.stdout or "Error" in result.stdout:
+                logger.debug("Ray cluster is not responsive ('No cluster status' returned or Error in output)")
+            elif "Found multiple active Ray instances" in result.stdout:
+                logger.warning(
+                    "Found multiple active Ray instances. Pleae set RAY_ADDRESS environment variable to the correct value."
+                )
+                responsive = False
+                break
+            else:
+                logger.debug("Ray cluster IS responsive")
+                responsive = True
+
+        except subprocess.CalledProcessError:
+            logger.debug("Ray cluster is not responsive ('ray status' command failed)")
+
+        except subprocess.TimeoutExpired:
+            logger.debug("Ray cluster is not responsive ('ray status' command timed out)")
+
+        timer = time.time() - t0
+        time.sleep(0.5)
+
+    if not responsive and timer >= timeout_s:
+        logger.debug("Ray cluster did not become responsive in time...")
+
+    return responsive
 
 
 def get_free_port(start_port: int, get_next_free_port: bool = True) -> int:
@@ -36,7 +100,7 @@ def get_free_port(start_port: int, get_next_free_port: bool = True) -> int:
     If not, it will get the next free port starting from start_port if get_next_free_port is True.
     Else, it will raise an error if the free port is not equal to start_port.
     """
-    for port in range(start_port, 65535):
+    for port in range(start_port, 65536):
         if port >= DEFAULT_RAY_MIN_WORKER_PORT and port <= DEFAULT_RAY_MAX_WORKER_PORT:
             continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -123,8 +187,21 @@ def init_cluster(  # noqa: PLR0913
 
     # We set some env vars for Xenna here. This is only used for Xenna clusters.
     os.environ["XENNA_RAY_METRICS_PORT"] = str(ray_metrics_port)
-    os.environ["XENNA_RESPECT_CUDA_VISIBLE_DEVICES"] = "1"
 
+    # Opt into Ray Serve's HAProxy ingress when both binaries resolve. Ray Serve
+    # uses socat to drive HAProxy's admin socket — without it, the controller's
+    # healthcheck silently returns False and trips a 5s timeout. Must precede
+    # Popen so Ray sees the env var at module-import on the raylet/worker.
+    # TODO(https://github.com/ray-project/ray/issues/62976): also set
+    # RAY_SERVE_HAPROXY_STATS_PORT once that lands so multi-cluster hosts
+    # don't collide on HAProxy's stats bind.
+    if shutil.which("haproxy") is not None and shutil.which("socat") is not None:
+        haproxy_metrics_port = get_free_port(DEFAULT_RAY_SERVE_HAPROXY_METRICS_PORT)
+        os.environ["RAY_SERVE_ENABLE_HA_PROXY"] = "1"
+        os.environ["RAY_SERVE_HAPROXY_METRICS_PORT"] = str(haproxy_metrics_port)
+        logger.info(f"Ray Serve HAProxy ingress enabled (metrics port {haproxy_metrics_port}).")
+    else:
+        logger.debug("haproxy and/or socat not found on PATH; Ray Serve will use the default Python proxy.")
     if stdouterr_capture_file:
         with open(stdouterr_capture_file, "w") as f:
             proc = subprocess.Popen(  # noqa: S603
@@ -133,4 +210,67 @@ def init_cluster(  # noqa: PLR0913
     else:
         proc = subprocess.Popen(ray_command, shell=False, start_new_session=True)  # noqa: S603
     logger.info(f"Ray start command: {' '.join(ray_command)}")
+
     return proc
+
+
+def split_table_by_group(
+    table: pa.Table,
+    group_column: str,
+    *,
+    max_batch_bytes: int | None = None,
+    max_batch_rows: int | None = None,
+) -> list[pa.Table]:
+    """Split an Arrow table without reordering or splitting consecutive groups.
+
+    Rows for each group must be consecutive. If a single group exceeds a batch
+    limit, it is still emitted as one chunk.
+    """
+    for name, value in (("max_batch_bytes", max_batch_bytes), ("max_batch_rows", max_batch_rows)):
+        if value is not None and value <= 0:
+            msg = f"{name} must be > 0, got {value}"
+            raise ValueError(msg)
+
+    if group_column not in table.column_names:
+        msg = f"Group column '{group_column}' not found in table"
+        raise ValueError(msg)
+    if table.num_rows == 0:
+        return [table]
+
+    chunked = table[group_column]
+    groups = chunked.combine_chunks() if len(chunked.chunks) > 1 else chunked.chunks[0]
+    if pc.any(pc.is_null(groups)).as_py():
+        msg = f"Group column '{group_column}' contains null values"
+        raise ValueError(msg)
+    if max_batch_bytes is None and max_batch_rows is None:
+        return [table]
+
+    num_rows = table.num_rows
+    group_change = pc.not_equal(groups.slice(1), groups.slice(0, num_rows - 1))
+    group_ends = [*(point + 1 for point in pc.indices_nonzero(group_change).to_pylist()), num_rows]
+
+    split_points: list[int] = []
+    chunk_start = 0
+    chunk_bytes = 0.0
+    chunk_rows = 0
+    avg_bytes_per_row = table.nbytes / num_rows
+    for group_end in group_ends:
+        group_start = chunk_start + chunk_rows
+        group_rows = group_end - group_start
+        group_bytes = group_rows * avg_bytes_per_row
+        exceeds_batch_limit = chunk_rows > 0 and (
+            (max_batch_bytes is not None and chunk_bytes + group_bytes > max_batch_bytes)
+            or (max_batch_rows is not None and chunk_rows + group_rows > max_batch_rows)
+        )
+        if exceeds_batch_limit:
+            split_points.append(group_start)
+            chunk_start = group_start
+            chunk_bytes = 0.0
+            chunk_rows = 0
+
+        chunk_bytes += group_bytes
+        chunk_rows += group_rows
+
+    starts = [0, *split_points]
+    ends = [*split_points, num_rows]
+    return [table.slice(start, end - start) for start, end in zip(starts, ends, strict=True)]
